@@ -28,9 +28,9 @@ export class AwsBedrockHandler implements ApiHandler {
 		const modelId = await this.getModelId()
 		const model = this.getModel()
 
-		// Check if this is an Amazon Nova model
-		if (modelId.includes("amazon.nova")) {
-			yield* this.createNovaMessage(systemPrompt, messages, modelId, model)
+		// Check if this model uses the Converse API (Nova, Writer)
+		if (modelId.includes("amazon.nova") || modelId.includes("writer.")) {
+			yield* this.createConverseApiMessage(systemPrompt, messages, modelId, model)
 			return
 		}
 
@@ -40,6 +40,7 @@ export class AwsBedrockHandler implements ApiHandler {
 			return
 		}
 
+		// Default to Anthropic SDK for Claude models
 		const budget_tokens = this.options.thinkingBudgetTokens || 0
 		const reasoningOn = modelId.includes("3-7") && budget_tokens !== 0 ? true : false
 
@@ -475,10 +476,9 @@ export class AwsBedrockHandler implements ApiHandler {
 	}
 
 	/**
-	 * Creates a message using Amazon Nova models through AWS Bedrock
-	 * Implements support for Nova Micro, Nova Lite, and Nova Pro models
+	 * Creates a message using models supporting the Bedrock Converse API (e.g., Nova, Writer).
 	 */
-	private async *createNovaMessage(
+	private async *createConverseApiMessage(
 		systemPrompt: string,
 		messages: Anthropic.Messages.MessageParam[],
 		modelId: string,
@@ -487,10 +487,10 @@ export class AwsBedrockHandler implements ApiHandler {
 		// Get Bedrock client with proper credentials
 		const client = await this.getBedrockClient()
 
-		// Format messages for Nova model
-		const formattedMessages = this.formatNovaMessages(messages)
+		// Format messages for the Converse API, handling text, image, and document types
+		const formattedMessages = this.formatConverseApiMessages(messages)
 
-		// Prepare request for Nova model
+		// Prepare request for the Converse API
 		const command = new ConverseStreamCommand({
 			modelId: modelId,
 			messages: formattedMessages,
@@ -570,18 +570,18 @@ export class AwsBedrockHandler implements ApiHandler {
 				}
 			}
 		} catch (error) {
-			console.error("Error processing Nova model response:", error)
+			console.error(`Error processing Converse API response for ${modelId}:`, error)
 			yield {
 				type: "text",
-				text: `[ERROR] Failed to process Nova response: ${error instanceof Error ? error.message : String(error)}`,
+				text: `[ERROR] Failed to process Converse API response: ${error instanceof Error ? error.message : String(error)}`,
 			}
 		}
 	}
 
 	/**
-	 * Formats messages for Amazon Nova models according to the SDK specification
+	 * Formats messages for the Bedrock Converse API, handling text, image, and document types.
 	 */
-	private formatNovaMessages(messages: Anthropic.Messages.MessageParam[]): { role: ConversationRole; content: any[] }[] {
+	private formatConverseApiMessages(messages: Anthropic.Messages.MessageParam[]): { role: ConversationRole; content: any[] }[] {
 		return messages.map((message) => {
 			// Determine role (user or assistant)
 			const role = message.role === "user" ? ConversationRole.USER : ConversationRole.ASSISTANT
@@ -603,41 +603,60 @@ export class AwsBedrockHandler implements ApiHandler {
 
 						// Image content
 						if (item.type === "image") {
-							// Handle different image source formats
-							let imageData: Uint8Array
+							let imageData: Buffer | null = null // Use Buffer, initialize to null
 							let format = "jpeg" // default format
 
-							// Extract format from media_type if available
 							if (item.source.media_type) {
-								// Extract format from media_type (e.g., "image/jpeg" -> "jpeg")
 								const formatMatch = item.source.media_type.match(/image\/(\w+)/)
 								if (formatMatch && formatMatch[1]) {
 									format = formatMatch[1]
-									// Ensure format is one of the allowed values
+									// Ensure format is one of the allowed types by Bedrock Converse
 									if (!["png", "jpeg", "gif", "webp"].includes(format)) {
-										format = "jpeg" // Default to jpeg if not supported
+										console.warn(`Unsupported image format "${format}" provided, defaulting to jpeg.`)
+										format = "jpeg"
 									}
 								}
 							}
 
-							// Get image data
+							const sourceData = item.source.data
+
 							try {
-								if (typeof item.source.data === "string") {
-									// Handle base64 encoded data
-									const base64Data = item.source.data.replace(/^data:image\/\w+;base64,/, "")
-									imageData = new Uint8Array(Buffer.from(base64Data, "base64"))
-								} else if (item.source.data && typeof item.source.data === "object") {
-									// Try to convert to Uint8Array
-									imageData = new Uint8Array(Buffer.from(item.source.data as any))
+								if (typeof sourceData === "string") {
+									// Handle base64 string
+									const base64Data = sourceData.replace(/^data:image\/\w+;base64,/, "")
+									imageData = Buffer.from(base64Data, "base64")
+								} else if (Buffer.isBuffer(sourceData)) {
+									// Handle Buffer directly
+									imageData = sourceData
+								} else if ((sourceData as any) instanceof Uint8Array) {
+									// Handle Uint8Array - convert to Buffer
+									imageData = Buffer.from(sourceData as Uint8Array)
+								} else if ((sourceData as any) instanceof ArrayBuffer) {
+									// Handle ArrayBuffer - convert to Buffer
+									imageData = Buffer.from(sourceData as ArrayBuffer)
 								} else {
-									console.error("Unsupported image data format")
-									return null // Skip this item if format is not supported
+									// Log error for unsupported types only if sourceData is not null/undefined
+									if (sourceData !== null) {
+										console.error(
+											`Unsupported image data type "${typeof sourceData}" for Converse API. Expected string, Buffer, Uint8Array, or ArrayBuffer.`,
+										)
+									} else {
+										console.error("Image source data is null or undefined.")
+									}
+									// imageData remains null
 								}
 							} catch (error) {
-								console.error("Could not convert image data to Uint8Array:", error)
-								return null // Skip this item if conversion fails
+								console.error("Error converting image data for Converse API:", error)
+								// imageData remains null
 							}
 
+							// If imageData is still null, conversion failed or type was unsupported
+							if (imageData === null) {
+								console.error("Skipping image block due to data conversion failure or unsupported type.")
+								return null
+							}
+
+							// Return the formatted image block for Converse API
 							return {
 								image: {
 									format,
@@ -648,10 +667,37 @@ export class AwsBedrockHandler implements ApiHandler {
 							}
 						}
 
-						// Return null for unsupported content types
+						// Document content (specific to Writer model via Converse API)
+						// Assumes input format: { type: 'document', source: { format: string, name: string, bytes: Uint8Array } }
+						if (item.type === "document" && item.source && typeof item.source === "object") {
+							const source = item.source as any // Type assertion for clarity
+							// Ensure all required fields are present and bytes is Uint8Array
+							if (
+								typeof source.format === "string" &&
+								typeof source.name === "string" &&
+								source.bytes && // Check if bytes exists
+								typeof source.bytes === "object" && // Explicitly check if it's an object
+								source.bytes instanceof Uint8Array
+							) {
+								return {
+									document: {
+										format: source.format,
+										name: source.name,
+										source: {
+											bytes: source.bytes,
+										},
+									},
+								}
+							} else {
+								console.error("Invalid document content block format for Converse API:", item)
+								return null
+							}
+						}
+
+						console.warn(`Unsupported content type "${item.type}" for Converse API, skipping.`)
 						return null
 					})
-					.filter(Boolean) // Remove any null items
+					.filter(Boolean) // Remove null items (unsupported types or errors)
 			}
 
 			// Return formatted message

@@ -282,6 +282,14 @@ export const bedrockModels = {
 		inputPrice: 1.35,
 		outputPrice: 5.4,
 	},
+	"writer.palmyra-x5-v1:0": {
+		maxTokens: 8_192,
+		contextWindow: 1_040_000,
+		supportsImages: false,
+		supportsPromptCache: false,
+		inputPrice: 0.6,
+		outputPrice: 6.0,
+	},
 } as const satisfies Record<string, ModelInfo>
 
 // OpenRouter
