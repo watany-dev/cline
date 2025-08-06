@@ -1,4 +1,4 @@
-import { memo, useCallback, useState, useEffect } from "react"
+import { memo, useCallback, useState, useEffect, useMemo } from "react"
 import {
 	AnthropicModelId,
 	anthropicDefaultModelId,
@@ -17,10 +17,15 @@ import {
 } from "@shared/api"
 import { VSCodeCheckbox } from "@vscode/webview-ui-toolkit/react"
 import styled from "styled-components"
+import { useExtensionState } from "@/context/ExtensionStateContext"
+import { useApiConfigurationHandlers } from "./utils/useApiConfigurationHandlers"
+import { getModeSpecificFields } from "./utils/providerUtils"
+import { Mode } from "@shared/storage/types"
 
 // Constants
 const DEFAULT_MIN_VALID_TOKENS = 1024
 const DEFAULT_MAX_PERCENTAGE = 0.8
+const MAX_PERCENTAGE = 0.8
 const THUMB_SIZE = 16
 
 // Styled Components
@@ -96,15 +101,17 @@ const RangeInput = styled.input<{ $value: number; $min: number; $max: number }>`
 `
 
 interface ThinkingBudgetSliderProps {
-	apiConfiguration: ApiConfiguration | undefined
-	setApiConfiguration: (apiConfiguration: ApiConfiguration) => void
 	maxBudget?: number
+	currentMode: Mode
 }
 
-const ThinkingBudgetSlider = ({ apiConfiguration, setApiConfiguration, maxBudget }: ThinkingBudgetSliderProps) => {
-	const isEnabled = (apiConfiguration?.thinkingBudgetTokens || 0) > 0
+const ThinkingBudgetSlider = ({ maxBudget, currentMode }: ThinkingBudgetSliderProps) => {
+	const { apiConfiguration } = useExtensionState()
+	const { handleModeFieldChange } = useApiConfigurationHandlers()
 
-	const [localValue, setLocalValue] = useState(apiConfiguration?.thinkingBudgetTokens || 0)
+	const modeFields = getModeSpecificFields(apiConfiguration, currentMode)
+
+	const [isEnabled, setIsEnabled] = useState<boolean>((modeFields.thinkingBudgetTokens || 0) > 0)
 
 	const getModelInfo = (provider?: string, modelId?: string): ModelInfo | undefined => {
 		if (!provider || !modelId) return undefined
@@ -124,8 +131,8 @@ const ThinkingBudgetSlider = ({ apiConfiguration, setApiConfiguration, maxBudget
 	}
 
 	const getModelThinkingConfig = (): { maxBudget?: number; percentage: number } => {
-		const provider = apiConfiguration?.apiProvider
-		const modelId = apiConfiguration?.apiModelId
+		const provider = modeFields.apiProvider
+		const modelId = modeFields.apiModelId
 
 		if (!provider || !modelId) {
 			return { percentage: DEFAULT_MAX_PERCENTAGE }
@@ -163,9 +170,9 @@ const ThinkingBudgetSlider = ({ apiConfiguration, setApiConfiguration, maxBudget
 		}
 	}
 
-	const maxTokens = (): number => {
-		const provider = apiConfiguration?.apiProvider
-		const modelId = apiConfiguration?.apiModelId
+	const maxTokens = useMemo(() => {
+		const provider = modeFields.apiProvider
+		const modelId = modeFields.apiModelId
 
 		if (!provider || !modelId) return 0
 
@@ -191,9 +198,10 @@ const ThinkingBudgetSlider = ({ apiConfiguration, setApiConfiguration, maxBudget
 			default:
 				return 0
 		}
-	}
+	}, [modeFields.apiProvider, modeFields.apiModelId])
 
-	const maxSliderValue = (() => {
+	// use maxBudget prop if provided, otherwise apply the percentage cap to maxTokens
+	const maxSliderValue = useMemo(() => {
 		if (maxBudget !== undefined) {
 			return maxBudget
 		}
@@ -203,24 +211,26 @@ const ThinkingBudgetSlider = ({ apiConfiguration, setApiConfiguration, maxBudget
 			return Math.floor(thinkingConfig.maxBudget * thinkingConfig.percentage)
 		}
 
-		return Math.floor(maxTokens() * DEFAULT_MAX_PERCENTAGE)
-	})()
+		return Math.floor(maxTokens * MAX_PERCENTAGE)
+	}, [maxBudget, maxTokens])
+
+	// Add local state for the slider value
+	const [localValue, setLocalValue] = useState(modeFields.thinkingBudgetTokens || 0)
 
 	useEffect(() => {
-		if (!apiConfiguration) return
-
-		const { thinkingBudgetTokens } = apiConfiguration
+		const { thinkingBudgetTokens } = modeFields
 
 		if (!thinkingBudgetTokens || thinkingBudgetTokens <= 0) return
 
 		if (thinkingBudgetTokens > maxSliderValue) {
 			setLocalValue(maxSliderValue)
-			setApiConfiguration({
-				...apiConfiguration,
-				thinkingBudgetTokens: maxSliderValue,
-			})
+			handleModeFieldChange(
+				{ plan: "planModeThinkingBudgetTokens", act: "actModeThinkingBudgetTokens" },
+				maxSliderValue,
+				currentMode,
+			)
 		}
-	}, [apiConfiguration?.apiProvider, apiConfiguration?.apiModelId, maxSliderValue, setApiConfiguration])
+	}, [modeFields.apiProvider, modeFields.apiModelId, maxSliderValue, handleModeFieldChange, currentMode])
 
 	const handleSliderChange = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
 		const value = parseInt(event.target.value, 10)
@@ -228,20 +238,20 @@ const ThinkingBudgetSlider = ({ apiConfiguration, setApiConfiguration, maxBudget
 	}, [])
 
 	const handleSliderComplete = () => {
-		setApiConfiguration({
-			...apiConfiguration,
-			thinkingBudgetTokens: localValue,
-		})
+		handleModeFieldChange(
+			{ plan: "planModeThinkingBudgetTokens", act: "actModeThinkingBudgetTokens" },
+			localValue,
+			currentMode,
+		)
 	}
 
 	const handleToggleChange = (event: any) => {
 		const isChecked = (event.target as HTMLInputElement).checked
 		const newValue = isChecked ? DEFAULT_MIN_VALID_TOKENS : 0
+		setIsEnabled(isChecked)
 		setLocalValue(newValue)
-		setApiConfiguration({
-			...apiConfiguration,
-			thinkingBudgetTokens: newValue,
-		})
+
+		handleModeFieldChange({ plan: "planModeThinkingBudgetTokens", act: "actModeThinkingBudgetTokens" }, newValue, currentMode)
 	}
 
 	return (

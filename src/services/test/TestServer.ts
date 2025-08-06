@@ -5,26 +5,15 @@ import { execa } from "execa"
 import { Logger } from "@services/logging/Logger"
 import { WebviewProvider } from "@core/webview"
 import { AutoApprovalSettings } from "@shared/AutoApprovalSettings"
-import { TaskServiceClient } from "webview-ui/src/services/grpc-client"
-import {
-	getWorkspacePath,
-	validateWorkspacePath,
-	initializeGitRepository,
-	getFileChanges,
-	calculateToolSuccessRate,
-} from "./GitHelper"
-import {
-	updateGlobalState,
-	getAllExtensionState,
-	updateApiConfiguration,
-	storeSecret,
-	updateWorkspaceState,
-} from "@core/storage/state"
+import { validateWorkspacePath, initializeGitRepository, getFileChanges, calculateToolSuccessRate } from "./GitHelper"
+import { updateGlobalState, getAllExtensionState, storeSecret } from "@core/storage/state"
 import { ClineAsk, ExtensionMessage } from "@shared/ExtensionMessage"
 import { ApiProvider } from "@shared/api"
 import { HistoryItem } from "@shared/HistoryItem"
 import { getSavedClineMessages, getSavedApiConversationHistory } from "@core/storage/disk"
-import { AskResponseRequest } from "@/shared/proto/task"
+import { AskResponseRequest } from "@shared/proto/cline/task"
+import { getCwd } from "@/utils/path"
+import { askResponse } from "@core/controller/task/askResponse"
 
 /**
  * Creates a tracker to monitor tool calls and failures during task execution
@@ -215,7 +204,7 @@ export function createTestServer(webviewProvider?: WebviewProvider): http.Server
 
 				try {
 					// Get and validate the workspace path
-					const workspacePath = getWorkspacePath(visibleWebview)
+					const workspacePath = await getCwd()
 					Logger.log(`Using workspace path: ${workspacePath}`)
 
 					// Validate workspace path before proceeding with any operations
@@ -257,6 +246,7 @@ export function createTestServer(webviewProvider?: WebviewProvider): http.Server
 					// Clear any existing task
 					await visibleWebview.controller.clearTask()
 
+					// TODO: convert apiKey to clineAccountId
 					// If API key is provided, update the API configuration
 					if (apiKey) {
 						Logger.log("API key provided, updating API configuration")
@@ -268,27 +258,31 @@ export function createTestServer(webviewProvider?: WebviewProvider): http.Server
 						const updatedConfig = {
 							...apiConfiguration,
 							apiProvider: "cline" as ApiProvider,
-							clineApiKey: apiKey,
+							clineAccountId: apiKey,
 						}
 
 						// Store the API key securely
-						await storeSecret(visibleWebview.controller.context, "clineApiKey", apiKey)
+						visibleWebview.controller.cacheService.setSecret("clineAccountId", apiKey)
 
-						// Update the API configuration
-						await updateApiConfiguration(visibleWebview.controller.context, updatedConfig)
+						visibleWebview.controller.cacheService.setApiConfiguration(updatedConfig)
 
-						// Update global state to use cline provider
-						await updateWorkspaceState(visibleWebview.controller.context, "apiProvider", "cline" as ApiProvider)
+						// Update cache service to use cline provider
+						const currentConfig = visibleWebview.controller.cacheService.getApiConfiguration()
+						visibleWebview.controller.cacheService.setApiConfiguration({
+							...currentConfig,
+							planModeApiProvider: "cline",
+							actModeApiProvider: "cline",
+						})
 
 						// Post state to webview to reflect changes
 						await visibleWebview.controller.postStateToWebview()
 					}
 
 					// Ensure we're in Act mode before initiating the task
-					const { chatSettings } = await visibleWebview.controller.getStateToPostToWebview()
-					if (chatSettings.mode === "plan") {
+					const { mode } = await visibleWebview.controller.getStateToPostToWebview()
+					if (mode === "plan") {
 						// Switch to Act mode if currently in Plan mode
-						await visibleWebview.controller.togglePlanActModeWithChatSettings({ mode: "act" })
+						await visibleWebview.controller.togglePlanActMode("act")
 					}
 
 					// Initialize tool call tracker
@@ -375,7 +369,7 @@ export function createTestServer(webviewProvider?: WebviewProvider): http.Server
 						let fileChanges
 						try {
 							// Get the workspace path using our helper function
-							const workspacePath = getWorkspacePath(visibleWebview)
+							const workspacePath = await getCwd()
 							Logger.log(`Getting file changes from workspace path: ${workspacePath}`)
 
 							// Log directory contents for debugging
@@ -615,7 +609,7 @@ async function autoRespondToAsk(webviewProvider: WebviewProvider, askType: Cline
 				try {
 					if (webviewProvider.controller) {
 						Logger.log("Auto-toggling to Act mode from Plan mode")
-						await webviewProvider.controller.togglePlanActModeWithChatSettings({ mode: "act" })
+						await webviewProvider.controller.togglePlanActMode("act")
 					}
 				} catch (error) {
 					Logger.log(`Error toggling to Act mode: ${error}`)
@@ -627,9 +621,10 @@ async function autoRespondToAsk(webviewProvider: WebviewProvider, askType: Cline
 		// we use the default "yesButtonClicked" to approve the action
 	}
 
-	// Send the response message
+	// Send the response message using the backend controller method
 	try {
-		await TaskServiceClient.askResponse(
+		await askResponse(
+			webviewProvider.controller,
 			AskResponseRequest.create({
 				responseType,
 				text: responseText,
