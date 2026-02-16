@@ -706,6 +706,17 @@ export const bedrockModels = {
 		description:
 			"Qwen3 Coder 480B flagship MoE model with 35B activated parameters, designed for complex coding tasks with advanced reasoning capabilities and 256K context window.",
 	},
+	"moonshot.kimi-k2-thinking-v1:0": {
+		maxTokens: 8192,
+		contextWindow: 128_000,
+		supportsImages: false,
+		supportsPromptCache: false,
+		supportsReasoning: true,
+		inputPrice: 0.6,
+		outputPrice: 2.5,
+		description:
+			"Moonshot Kimi K2 Thinking - a 1T parameter MoE model (32B active) with deep reasoning capabilities, optimized for complex coding, agentic tool use, and multi-step reasoning.",
+	},
 } as const satisfies Record<string, ModelInfo>
 
 // OpenRouter

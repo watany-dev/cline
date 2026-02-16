@@ -187,6 +187,12 @@ export class AwsBedrockHandler implements ApiHandler {
 			return
 		}
 
+		// Check if this is a Moonshot model
+		if (baseModelId.includes("moonshot")) {
+			yield* this.createMoonshotMessage(systemPrompt, messages, modelId, model, tools)
+			return
+		}
+
 		// Default: Use Anthropic Converse API for all Anthropic models
 		yield* this.createAnthropicMessage(systemPrompt, messages, modelId, model, enable1mContextWindow, tools)
 	}
@@ -506,6 +512,275 @@ export class AwsBedrockHandler implements ApiHandler {
 				totalCost: finalTotalCost,
 			}
 		}
+	}
+
+	/**
+	 * Creates a message using Moonshot Kimi K2 models through AWS Bedrock.
+	 * Uses InvokeModelWithResponseStream with OpenAI chat completions format (not the Converse API).
+	 * Reasoning content is returned within <reasoning> tags in the response text.
+	 */
+	private async *createMoonshotMessage(
+		systemPrompt: string,
+		messages: ClineStorageMessage[],
+		modelId: string,
+		model: { id: string; info: ModelInfo },
+		_tools?: ClineTool[],
+	): ApiStream {
+		const client = await this.getBedrockClient()
+
+		// Format messages for OpenAI chat completions format
+		const formattedMessages = this.formatMoonshotMessages(systemPrompt, messages)
+
+		// Prepare the request body in OpenAI chat completions format
+		const requestBody: Record<string, unknown> = {
+			messages: formattedMessages,
+			max_tokens: model.info.maxTokens || 8192,
+			temperature: 1.0,
+		}
+
+		const command = new InvokeModelWithResponseStreamCommand({
+			modelId: modelId,
+			contentType: "application/json",
+			accept: "application/json",
+			body: JSON.stringify(requestBody),
+		})
+
+		// Track token usage
+		let inputTokens = 0
+		let outputTokens = 0
+		let isFirstChunk = true
+		let accumulatedTokens = 0
+		const TOKEN_REPORT_THRESHOLD = 100
+
+		// State for parsing reasoning tags from streaming text
+		let inReasoning = false
+		let pendingBuffer = ""
+
+		const response = await client.send(command)
+
+		if (response.body) {
+			for await (const chunk of response.body) {
+				if (chunk.chunk?.bytes) {
+					try {
+						const decodedChunk = new TextDecoder().decode(chunk.chunk.bytes)
+						const parsedChunk = JSON.parse(decodedChunk)
+
+						// Report initial usage on first chunk
+						if (isFirstChunk) {
+							isFirstChunk = false
+							// Extract usage info if available in the first chunk
+							if (parsedChunk.usage) {
+								inputTokens = parsedChunk.usage.prompt_tokens || 0
+								const totalCost = calculateApiCostOpenAI(model.info, inputTokens, 0, 0, 0)
+								yield {
+									type: "usage",
+									inputTokens: inputTokens,
+									outputTokens: 0,
+									totalCost: totalCost,
+								}
+							}
+						}
+
+						// Handle OpenAI chat completions streaming format
+						if (parsedChunk.choices && parsedChunk.choices.length > 0) {
+							const choice = parsedChunk.choices[0]
+
+							// Handle streaming delta format
+							const content = choice.delta?.content || choice.message?.content || ""
+
+							if (content) {
+								const chunkTokens = this.estimateTokenCount(content)
+								outputTokens += chunkTokens
+								accumulatedTokens += chunkTokens
+
+								// Process the content through reasoning tag parser
+								yield* this.processReasoningTags(
+									content,
+									inReasoning,
+									pendingBuffer,
+									(newInReasoning, newBuffer) => {
+										inReasoning = newInReasoning
+										pendingBuffer = newBuffer
+									},
+								)
+
+								if (accumulatedTokens >= TOKEN_REPORT_THRESHOLD) {
+									const totalCost = calculateApiCostOpenAI(model.info, 0, accumulatedTokens, 0, 0)
+									yield {
+										type: "usage",
+										inputTokens: 0,
+										outputTokens: accumulatedTokens,
+										totalCost: totalCost,
+									}
+									accumulatedTokens = 0
+								}
+							}
+
+							// Extract usage from the final chunk if available
+							if (parsedChunk.usage) {
+								inputTokens = parsedChunk.usage.prompt_tokens || inputTokens
+								outputTokens = parsedChunk.usage.completion_tokens || outputTokens
+							}
+						}
+					} catch (error) {
+						Logger.error("Error parsing Moonshot response chunk:", error)
+						yield {
+							type: "text",
+							text: `[ERROR] Failed to parse Moonshot response: ${error instanceof Error ? error.message : String(error)}`,
+						}
+					}
+				}
+			}
+
+			// Flush any remaining pending buffer
+			if (pendingBuffer) {
+				if (inReasoning) {
+					yield { type: "reasoning", reasoning: pendingBuffer }
+				} else {
+					yield { type: "text", text: pendingBuffer }
+				}
+			}
+
+			// Report any remaining accumulated tokens
+			if (accumulatedTokens > 0) {
+				const totalCost = calculateApiCostOpenAI(model.info, 0, accumulatedTokens, 0, 0)
+				yield {
+					type: "usage",
+					inputTokens: 0,
+					outputTokens: accumulatedTokens,
+					totalCost: totalCost,
+				}
+			}
+
+			// Final total cost
+			const finalTotalCost = calculateApiCostOpenAI(model.info, inputTokens, outputTokens, 0, 0)
+			yield {
+				type: "usage",
+				inputTokens: inputTokens,
+				outputTokens: outputTokens,
+				totalCost: finalTotalCost,
+			}
+		}
+	}
+
+	/**
+	 * Formats messages for Moonshot models using OpenAI chat completions format
+	 */
+	private formatMoonshotMessages(
+		systemPrompt: string,
+		messages: ClineStorageMessage[],
+	): Array<{ role: string; content: string }> {
+		const formattedMessages: Array<{ role: string; content: string }> = []
+
+		// Add system message
+		if (systemPrompt) {
+			formattedMessages.push({ role: "system", content: systemPrompt })
+		}
+
+		// Convert messages to OpenAI format
+		for (const message of messages) {
+			const role = message.role === "user" ? "user" : "assistant"
+			let content = ""
+
+			if (typeof message.content === "string") {
+				content = message.content
+			} else if (Array.isArray(message.content)) {
+				// Extract text content from message parts (Moonshot doesn't support images via InvokeModel)
+				content = message.content
+					.filter((part) => part.type === "text")
+					.map((part) => part.text)
+					.join("\n")
+			}
+
+			if (content) {
+				formattedMessages.push({ role, content })
+			}
+		}
+
+		// Merge consecutive messages with the same role
+		const mergedMessages: Array<{ role: string; content: string }> = []
+		for (const msg of formattedMessages) {
+			const last = mergedMessages[mergedMessages.length - 1]
+			if (last && last.role === msg.role) {
+				last.content += "\n\n" + msg.content
+			} else {
+				mergedMessages.push({ ...msg })
+			}
+		}
+
+		return mergedMessages
+	}
+
+	/**
+	 * Processes streaming text content and separates reasoning tags from regular text.
+	 * Handles partial tag boundaries across streaming chunks.
+	 */
+	private *processReasoningTags(
+		content: string,
+		inReasoning: boolean,
+		pendingBuffer: string,
+		updateState: (inReasoning: boolean, pendingBuffer: string) => void,
+	): Generator<{ type: "text"; text: string } | { type: "reasoning"; reasoning: string }> {
+		const REASONING_OPEN_TAG = "<reasoning>"
+		const REASONING_CLOSE_TAG = "</reasoning>"
+
+		let buffer = pendingBuffer + content
+		let newInReasoning = inReasoning
+
+		while (buffer.length > 0) {
+			if (newInReasoning) {
+				// Look for closing tag
+				const closeIdx = buffer.indexOf(REASONING_CLOSE_TAG)
+				if (closeIdx !== -1) {
+					// Found closing tag - emit reasoning content before it
+					const reasoningContent = buffer.substring(0, closeIdx)
+					if (reasoningContent) {
+						yield { type: "reasoning", reasoning: reasoningContent }
+					}
+					buffer = buffer.substring(closeIdx + REASONING_CLOSE_TAG.length)
+					newInReasoning = false
+				} else if (buffer.length > REASONING_CLOSE_TAG.length) {
+					// No closing tag found, but buffer is large enough that partial tag
+					// can only be at the end. Emit everything except the potential partial tag.
+					const safeLength = buffer.length - REASONING_CLOSE_TAG.length + 1
+					const safeContent = buffer.substring(0, safeLength)
+					if (safeContent) {
+						yield { type: "reasoning", reasoning: safeContent }
+					}
+					buffer = buffer.substring(safeLength)
+					break // Keep remaining in pending buffer
+				} else {
+					// Buffer too small, could be partial tag - keep in pending
+					break
+				}
+			} else {
+				// Look for opening tag
+				const openIdx = buffer.indexOf(REASONING_OPEN_TAG)
+				if (openIdx !== -1) {
+					// Found opening tag - emit text content before it
+					const textContent = buffer.substring(0, openIdx)
+					if (textContent) {
+						yield { type: "text", text: textContent }
+					}
+					buffer = buffer.substring(openIdx + REASONING_OPEN_TAG.length)
+					newInReasoning = true
+				} else if (buffer.length > REASONING_OPEN_TAG.length) {
+					// No opening tag found, emit everything except potential partial tag at end
+					const safeLength = buffer.length - REASONING_OPEN_TAG.length + 1
+					const safeContent = buffer.substring(0, safeLength)
+					if (safeContent) {
+						yield { type: "text", text: safeContent }
+					}
+					buffer = buffer.substring(safeLength)
+					break // Keep remaining in pending buffer
+				} else {
+					// Buffer too small, could be partial tag - keep in pending
+					break
+				}
+			}
+		}
+
+		updateState(newInReasoning, buffer)
 	}
 
 	/**
