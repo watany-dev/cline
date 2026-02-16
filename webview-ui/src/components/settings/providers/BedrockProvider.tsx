@@ -24,7 +24,8 @@ export const SUPPORTED_BEDROCK_THINKING_MODELS = [
 	"anthropic.claude-opus-4-1-20250805-v1:0",
 	"anthropic.claude-opus-4-20250514-v1:0",
 	"anthropic.claude-haiku-4-5-20251001-v1:0",
-	"moonshot.kimi-k2-thinking-v1:0",
+	"moonshot.kimi-k2-thinking",
+	"moonshot.kimi-k2-5",
 ]
 
 const AWS_REGIONS = BedrockData.regions
